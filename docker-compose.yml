@@ -1,0 +1,265 @@
+name: hudi-pipeline
+
+x-spark-env: &spark-env
+  SPARK_NO_DAEMONIZE: "true"
+  PYSPARK_PYTHON: python3
+  PYSPARK_DRIVER_PYTHON: python3
+
+networks:
+  hudi-net:
+    name: hudi-net
+    driver: bridge
+
+volumes:
+  kafka-data:
+  minio-data:
+  postgres-data:
+  ivy-cache:
+  hms-aux-libs:
+  hms-logs:
+
+services:
+  # ───────────────────────────── Kafka (KRaft, single broker) ─────────────────────────────
+  kafka:
+    image: bitnamilegacy/kafka:3.7.1
+    container_name: kafka
+    hostname: kafka
+    networks: [hudi-net]
+    ports:
+      - "9092:9092"
+      - "9094:9094"
+    environment:
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_CFG_PROCESS_ROLES: "broker,controller"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_CFG_NUM_PARTITIONS: "3"
+      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_CFG_LOG_RETENTION_HOURS: "24"
+      KAFKA_CFG_MESSAGE_MAX_BYTES: "10485760"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    volumes:
+      - kafka-data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/bitnami/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    networks: [hudi-net]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8088:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+  # ───────────────────────────── MinIO (S3 storage for Hudi) ──────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-08-17T01-24-54Z
+    container_name: minio
+    networks: [hudi-net]
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: admin12345
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-08-17T11-33-50Z
+    container_name: minio-init
+    networks: [hudi-net]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 admin admin12345; do sleep 2; done;
+      mc mb -p local/lakehouse || true;
+      mc mb -p local/warehouse || true;
+      mc anonymous set download local/lakehouse || true;
+      echo 'MinIO buckets ready';
+      "
+
+  # ───────────────────────────── Hive Metastore (Postgres-backed) ─────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    networks: [hudi-net]
+    environment:
+      POSTGRES_DB: metastore
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d metastore"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  hms-deps:
+    image: alpine:3.20
+    container_name: hms-deps
+    networks: [hudi-net]
+    volumes:
+      - hms-aux-libs:/aux
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - |
+        set -e
+        mkdir -p /aux
+        if [ ! -f /aux/postgresql.jar ]; then
+          apk add --no-cache curl >/dev/null
+          echo "[hms-deps] downloading postgres jdbc..."
+          curl -fsSL -o /aux/postgresql.jar https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.3/postgresql-42.7.3.jar
+          echo "[hms-deps] done"
+        else
+          echo "[hms-deps] postgres jdbc already present"
+        fi
+
+  hive-metastore:
+    build:
+      context: ./hive-metastore
+    image: hudi-pipeline/hive-metastore:4.0.0
+    container_name: hive-metastore
+    networks: [hudi-net]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      hms-deps:
+        condition: service_completed_successfully
+    ports:
+      - "9083:9083"
+    environment:
+      DB_DRIVER: postgres
+      SERVICE_NAME: metastore
+      VERBOSE: "true"
+      HIVE_CUSTOM_CONF_DIR: /hive_custom_conf
+    volumes:
+      - ./hive-metastore/conf/hive-site.xml:/hive_custom_conf/hive-site.xml:ro
+      - ./hive-metastore/conf/core-site.xml:/hive_custom_conf/core-site.xml:ro
+      - hms-aux-libs:/aux:ro
+      - hms-logs:/tmp
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9083' >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 90s
+
+  # ───────────────────────────── Spark (master + 1 worker) ────────────────────────────────
+  spark-master:
+    build:
+      context: ./spark
+    image: hudi-pipeline/spark:3.5.1
+    container_name: spark-master
+    networks: [hudi-net]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      hive-metastore:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+      - "4040:4040"
+    environment:
+      <<: *spark-env
+      SPARK_MODE: master
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_WEBUI_PORT: "8080"
+    volumes:
+      - ./jobs:/opt/jobs
+      - ./spark/conf/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf:ro
+      - ivy-cache:/home/spark/.ivy2
+
+  spark-worker:
+    image: hudi-pipeline/spark:3.5.1
+    container_name: spark-worker
+    networks: [hudi-net]
+    depends_on:
+      spark-master:
+        condition: service_started
+    ports:
+      - "8081:8081"
+    environment:
+      <<: *spark-env
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 3G
+      SPARK_WORKER_CORES: "3"
+      SPARK_WORKER_WEBUI_PORT: "8081"
+    volumes:
+      - ./jobs:/opt/jobs
+      - ./spark/conf/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf:ro
+      - ivy-cache:/home/spark/.ivy2
+
+  # ───────────────────────────── Trino (query engine for Hudi) ────────────────────────────
+  trino:
+    image: trinodb/trino:451
+    container_name: trino
+    networks: [hudi-net]
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    ports:
+      - "8090:8080"
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xms512m -Xmx1g"
+    volumes:
+      - ./trino/conf/catalog:/etc/trino/catalog:ro
+      - ./trino/conf/jvm.config:/etc/trino/jvm.config:ro
+      - ./trino/conf/config.properties:/etc/trino/config.properties:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/v1/info | grep -q '\"starting\":false' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # ───────────────────────────── Producer (Python) ────────────────────────────────────────
+  producer:
+    build:
+      context: ./producer
+    image: hudi-pipeline/producer:latest
+    container_name: producer
+    networks: [hudi-net]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: events
+      EVENTS_PER_SECOND: "200"
+      TOTAL_EVENTS: "20000"
+    volumes:
+      - ./producer:/app
+    profiles: ["producer"]
+    command: ["python", "-u", "produce.py"]

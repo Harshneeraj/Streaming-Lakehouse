@@ -1,0 +1,78 @@
+name: mini-iceberg
+
+# This compose stack is *separate* from the main hudi-pipeline. It runs a
+# dedicated MinIO + a Python worker that uses our miniiceberg library.
+#
+# If the main hudi-pipeline stack is up, this one piggy-backs on its MinIO
+# (host port 9000). If it isn't up, this stack starts its own.
+
+networks:
+  mini-iceberg-net:
+    name: mini-iceberg-net
+    driver: bridge
+  hudi-net:
+    # Reuse the main project's network so we can talk to its `minio:9000`.
+    # If the main project isn't up, use `make up-standalone` instead.
+    external: true
+
+volumes:
+  mi-minio-data:
+
+services:
+  # Optional MinIO. Skip with `make up-app-only` if the main project's MinIO is already running.
+  minio:
+    image: minio/minio:RELEASE.2024-08-17T01-24-54Z
+    container_name: mi-minio
+    networks: [mini-iceberg-net]
+    profiles: ["standalone"]
+    ports:
+      - "9100:9000"      # different host ports so we don't clash with the main project
+      - "9101:9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: admin12345
+    command: server /data --console-address ":9001"
+    volumes:
+      - mi-minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-08-17T11-33-50Z
+    container_name: mi-minio-init
+    networks: [mini-iceberg-net]
+    profiles: ["standalone"]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://mi-minio:9000 admin admin12345; do sleep 2; done;
+      mc mb -p local/iceberg-warehouse || true;
+      echo 'mini-iceberg bucket ready';
+      "
+
+  # The worker container. Has our library + pyarrow + duckdb installed.
+  app:
+    build:
+      context: .
+    image: mini-iceberg/app:latest
+    container_name: mi-app
+    networks:
+      - mini-iceberg-net
+      - hudi-net   # so we can reach the main project's MinIO if it's running
+    environment:
+      # By default, point at the main project's MinIO (host alias `minio`).
+      # Override to mi-minio:9000 for the standalone profile.
+      ICEBERG_S3_ENDPOINT: ${ICEBERG_S3_ENDPOINT:-http://minio:9000}
+      ICEBERG_S3_KEY: ${ICEBERG_S3_KEY:-admin}
+      ICEBERG_S3_SECRET: ${ICEBERG_S3_SECRET:-admin12345}
+      ICEBERG_WAREHOUSE: ${ICEBERG_WAREHOUSE:-s3://iceberg-warehouse}
+    volumes:
+      - ./miniiceberg:/app/miniiceberg:ro
+      - ./examples:/app/examples:ro
+      - ./tests:/app/tests:ro
+    command: ["sleep", "infinity"]   # keep container alive, run scripts via `docker exec`

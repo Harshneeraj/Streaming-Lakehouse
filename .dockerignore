@@ -1,0 +1,10 @@
+.git
+.gitignore
+.idea
+.vscode
+docs/RUN_LOG.md
+volumes
+data
+ivy-cache
+**/__pycache__
+*.pyc
