@@ -2,6 +2,8 @@
 
 A self-contained streaming lakehouse you can run on a single host.
 
+![Architecture](Architecture.jpg)
+
 ## What's in the box
 
 | Component        | Image                                | Role                                             |
@@ -99,6 +101,9 @@ what is in the box, why each piece is configured the way it is, and how to opera
   Postgres JDBC driver plus symlinks for `hadoop-aws` / `aws-java-sdk-bundle` (which the
   base image already ships under `/opt/hadoop/share/hadoop/tools/lib/`) into Hive's lib
   directory.
+
+  ![Hive Metastore](hive-metastore/Hive.jpg)
+
 * **Trino 451** — current LTS-grade build with a mature Hudi connector that no longer
   needs Hudi's deprecated input format.
 
