@@ -1,0 +1,5 @@
+SELECT t."TBL_NAME", t."TBL_TYPE", s."LOCATION", s."INPUT_FORMAT"
+FROM "TBLS" t
+JOIN "SDS" s ON t."SD_ID" = s."SD_ID"
+WHERE t."TBL_NAME" LIKE 'orders_%'
+ORDER BY t."TBL_NAME";
